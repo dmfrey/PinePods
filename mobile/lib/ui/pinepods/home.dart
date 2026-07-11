@@ -23,10 +23,14 @@ import 'package:pinepods_mobile/ui/pinepods/episode_details.dart';
 import 'package:pinepods_mobile/ui/pinepods/podcast_details.dart';
 import 'package:pinepods_mobile/entities/pinepods_search.dart';
 import 'package:pinepods_mobile/ui/widgets/episode_context_menu.dart';
+import 'package:pinepods_mobile/ui/pinepods/podcast_nav.dart';
 import 'package:pinepods_mobile/ui/utils/player_utils.dart';
 import 'package:pinepods_mobile/ui/widgets/server_error_page.dart';
 import 'package:pinepods_mobile/services/error_handling_service.dart';
 import 'package:pinepods_mobile/services/auto_download/auto_download_service.dart';
+import 'package:pinepods_mobile/services/auto_download/queue_download_service.dart';
+import 'package:pinepods_mobile/services/auto_download/mirror_download_service.dart';
+import 'package:pinepods_mobile/ui/utils/live_progress.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 
@@ -150,6 +154,20 @@ class _PinepodsHomeState extends State<PinepodsHome> {
 
       // Check for new episodes on auto-download podcasts (fire-and-forget)
       AutoDownloadService.checkAndDownloadNewEpisodes(
+        context: context,
+        pinepodsService: _pinepodsService,
+        userId: settings.pinepodsUserId!,
+      );
+
+      // Keep the top-N queued episodes downloaded (fire-and-forget)
+      QueueDownloadService.syncQueueDownloads(
+        context: context,
+        pinepodsService: _pinepodsService,
+        userId: settings.pinepodsUserId!,
+      );
+
+      // Mirror the server's downloaded episodes to this device (fire-and-forget)
+      MirrorDownloadService.syncMirror(
         context: context,
         pinepodsService: _pinepodsService,
         userId: settings.pinepodsUserId!,
@@ -636,8 +654,10 @@ class _PinepodsHomeState extends State<PinepodsHome> {
           queued: homeEpisode.queued,
           downloaded: homeEpisode.downloaded,
           isYoutube: homeEpisode.isYoutube,
+          podcastId: homeEpisode.podcastId,
         );
 
+        final pageContext = context;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           showDialog(
             context: context,
@@ -674,6 +694,16 @@ class _PinepodsHomeState extends State<PinepodsHome> {
               onDismiss: () {
                 Navigator.of(context).pop();
                 _hideContextMenu();
+              },
+              onPodcastTap: () {
+                Navigator.of(context).pop();
+                _hideContextMenu();
+                navigateToPodcastById(
+                  pageContext,
+                  episode.podcastId,
+                  fallbackTitle: episode.podcastName,
+                  fallbackArtwork: episode.episodeArtwork,
+                );
               },
             ),
           );
@@ -1253,9 +1283,11 @@ class _EpisodeCardState extends State<_EpisodeCard> {
   bool _isLoading = false;
   AudioState _audioState = AudioState.none;
   Episode? _nowPlaying;
+  PositionState? _positionState;
   AudioBloc? _audioBloc;
   StreamSubscription? _nowPlayingSub;
   StreamSubscription? _audioStateSub;
+  StreamSubscription? _positionSub;
 
   @override
   void didChangeDependencies() {
@@ -1264,6 +1296,7 @@ class _EpisodeCardState extends State<_EpisodeCard> {
     if (_audioBloc != bloc) {
       _nowPlayingSub?.cancel();
       _audioStateSub?.cancel();
+      _positionSub?.cancel();
       _audioBloc = bloc;
 
       _nowPlayingSub = bloc.nowPlaying?.listen((ep) {
@@ -1275,6 +1308,19 @@ class _EpisodeCardState extends State<_EpisodeCard> {
           if (state == AudioState.error) _isLoading = false;
         });
       });
+      // Live position ticks for this card's progress bar while it's the
+      // episode currently playing - mirrors what mini_player.dart already
+      // does with the same stream. Without this the bar was frozen at
+      // whatever listenDuration Home's data snapshot had when it loaded.
+      // Ticks fire roughly once a second during playback, so only rebuild
+      // this card when it's the one actually playing - checking the guid
+      // before calling setState avoids every card on Home rebuilding on
+      // every tick.
+      _positionSub = bloc.playPosition?.listen((state) {
+        if (!mounted) return;
+        if (state.episode?.guid != widget.episode.episodeUrl) return;
+        setState(() => _positionState = state);
+      });
     }
   }
 
@@ -1282,12 +1328,33 @@ class _EpisodeCardState extends State<_EpisodeCard> {
   void dispose() {
     _nowPlayingSub?.cancel();
     _audioStateSub?.cancel();
+    _positionSub?.cancel();
     super.dispose();
   }
 
   bool get _isCurrentEpisode =>
       widget.episode.episodeUrl.isNotEmpty &&
       _nowPlaying?.guid == widget.episode.episodeUrl;
+
+  /// Progress (0-100) to show on the bar: live position while this card is
+  /// the episode actually playing, otherwise the static value from Home's
+  /// last-loaded snapshot.
+  double get _displayProgressPercentage => LiveProgressResolver.percentage(
+        isCurrentEpisode: _isCurrentEpisode,
+        staticPercentage: widget.episode.progressPercentage,
+        livePercentage: _positionState?.percentage,
+      );
+
+  String? get _displayListenDurationText => LiveProgressResolver.elapsedText(
+        isCurrentEpisode: _isCurrentEpisode,
+        staticText: widget.episode.formattedListenDuration,
+        livePosition: _positionState?.position,
+      );
+
+  bool get _showProgressSection => LiveProgressResolver.shouldShowProgress(
+        isCurrentEpisode: _isCurrentEpisode,
+        hasStaticProgress: widget.episode.listenDuration != null && widget.episode.listenDuration! > 0,
+      );
 
   bool get _isPlaying =>
       _isCurrentEpisode &&
@@ -1330,6 +1397,26 @@ class _EpisodeCardState extends State<_EpisodeCard> {
       playIcon = Icons.play_circle_outline;
       iconColor = Theme.of(context).primaryColor;
     }
+
+    // Status indicators shown inline with the duration so the right column can
+    // host a larger play button without growing the card.
+    final statusIcons = <Widget>[
+      if (widget.episode.saved)
+        Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Icon(Icons.bookmark, size: 16, color: Colors.orange[600]),
+        ),
+      if (widget.episode.downloaded)
+        Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Icon(Icons.download_done, size: 16, color: Colors.green[600]),
+        ),
+      if (widget.episode.queued)
+        Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Icon(Icons.queue_music, size: 16, color: Colors.blue[600]),
+        ),
+    ];
 
     return Card(
       child: InkWell(
@@ -1385,10 +1472,13 @@ class _EpisodeCardState extends State<_EpisodeCard> {
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 8),
-                  // Progress bar for in-progress episodes
-                  if (widget.episode.listenDuration != null && widget.episode.listenDuration! > 0) ...[
+                  // Progress bar for in-progress episodes - also shown while
+                  // this card is actively playing even if Home's snapshot
+                  // hadn't recorded a listen position yet (e.g. just started
+                  // from 0 via auto-advance or this card's own play button).
+                  if (_showProgressSection) ...[
                     LinearProgressIndicator(
-                      value: widget.episode.progressPercentage / 100,
+                      value: _displayProgressPercentage / 100,
                       backgroundColor: Theme.of(context).colorScheme.surfaceVariant,
                       valueColor: AlwaysStoppedAnimation<Color>(
                         Theme.of(context).colorScheme.primary,
@@ -1396,87 +1486,62 @@ class _EpisodeCardState extends State<_EpisodeCard> {
                     ),
                     const SizedBox(height: 4),
                     Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(
-                          widget.episode.formattedListenDuration ?? '',
+                          _displayListenDurationText ?? '',
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
+                        const Spacer(),
                         Text(
                           widget.episode.formattedDuration,
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
+                        ...statusIcons,
                       ],
                     ),
                   ] else ...[
-                    Text(
-                      widget.episode.formattedDuration,
-                      style: Theme.of(context).textTheme.bodySmall,
+                    Row(
+                      children: [
+                        Text(
+                          widget.episode.formattedDuration,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const Spacer(),
+                        ...statusIcons,
+                      ],
                     ),
                   ],
                 ],
               ),
             ),
-            // Status indicators and play button
-            Column(
-              children: [
-                if (widget.onPlayPressed != null)
-                  SizedBox(
-                    width: 32,
-                    height: 32,
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 200),
-                      child: showSpinner
-                          ? Padding(
-                              key: const ValueKey('loading'),
-                              padding: const EdgeInsets.all(4.0),
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.5,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  Theme.of(context).primaryColor,
-                                ),
-                              ),
-                            )
-                          : GestureDetector(
-                              key: ValueKey(playIcon),
-                              behavior: HitTestBehavior.opaque,
-                              onTap: _onButtonTap,
-                              child: Icon(playIcon, color: iconColor, size: 28),
+            // Larger play button (status icons moved next to the duration).
+            if (widget.onPlayPressed != null) ...[
+              const SizedBox(width: 4),
+              SizedBox(
+                width: 48,
+                height: 48,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: showSpinner
+                      ? Padding(
+                          key: const ValueKey('loading'),
+                          padding: const EdgeInsets.all(8.0),
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.5,
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              Theme.of(context).primaryColor,
                             ),
-                    ),
-                  ),
-                const SizedBox(height: 4),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (widget.episode.saved)
-                      Icon(
-                        Icons.bookmark,
-                        size: 16,
-                        color: Colors.orange[600],
-                      ),
-                    if (widget.episode.downloaded)
-                      Padding(
-                        padding: const EdgeInsets.only(left: 4),
-                        child: Icon(
-                          Icons.download_done,
-                          size: 16,
-                          color: Colors.green[600],
+                          ),
+                        )
+                      : GestureDetector(
+                          key: ValueKey(playIcon),
+                          behavior: HitTestBehavior.opaque,
+                          onTap: _onButtonTap,
+                          child: Icon(playIcon, color: iconColor, size: 40),
                         ),
-                      ),
-                    if (widget.episode.queued)
-                      Padding(
-                        padding: const EdgeInsets.only(left: 4),
-                        child: Icon(
-                          Icons.queue_music,
-                          size: 16,
-                          color: Colors.blue[600],
-                        ),
-                      ),
-                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ],
         ),
       ),
